@@ -1,0 +1,177 @@
+import math
+from PIL import Image
+import csv
+import asyncio
+import aiohttp
+import io
+import os
+import sys
+
+limit = asyncio.Semaphore(1)
+
+class ResponseObject:
+    def __init__(self, title: str, artist: str, mbid: str, response: aiohttp.ClientResponse) -> None:
+        self.title = title
+        self.artist = artist
+        self.mbid = mbid
+        self.response = response
+        
+
+async def mbid_request(title: str, artist: str, count: int) -> ResponseObject:
+    
+    async with limit:
+        print(str(count) + ". Making MBID request for " + title + " - " + artist + ":")
+        musicbee_url = "http://www.musicbrainz.org/ws/2/release-group/?fmt=json&query=artist:" + artist.replace(" ", "%20") + "+title:" + title.replace(" ", "%20")
+
+        async with aiohttp.ClientSession() as session:
+            response = await session.get(musicbee_url)
+
+            if response.status == 200:
+                print("MBID found!")
+                result = await response.json()
+                mbid = result["release-groups"][0]["id"] 
+
+                return ResponseObject(title, artist, mbid, response)
+            elif response.status == 503:
+                print("Rate limit reached! Trying again.")
+                await asyncio.sleep(1)
+                mbid_request(title, artist, count)
+            else:
+                print("Error for this release!")
+
+
+def generate_mb_tasks(csv_file: str) -> list[asyncio.Task]:
+    tasks = []
+    count = 1
+    with open(os.path.join(sys.path[0], csv_file)) as file:
+        reader = csv.reader(file)
+        for row in reader:
+            tasks.append(asyncio.create_task(mbid_request(row[0], row[1], count)))
+            count += 1
+
+    return tasks
+
+def generate_ca_tasks(session, ResponseObjects: list[ResponseObject]) -> list[asyncio.Task]:
+    tasks = []
+
+    for ResponseObject in ResponseObjects:
+        ca_url = "https://coverartarchive.org/release-group/" + ResponseObject.mbid
+        tasks.append(session.get(ca_url))
+    return tasks
+
+
+async def get_url_from_csv(csv_file: str) -> list:
+
+    mb_tasks = generate_mb_tasks(csv_file)
+    mb_responses = await asyncio.gather(*mb_tasks)
+
+    ca_results = []
+
+    async with aiohttp.ClientSession() as session:
+        ca_tasks = generate_ca_tasks(session, mb_responses)
+        ca_responses = await asyncio.gather(*ca_tasks)
+
+        for no, response in enumerate(ca_responses):
+            if response.status == 200:
+                print("Cover art for " + mb_responses[no].title + " - " + mb_responses[no].artist + " found!")
+                ca_results.append(await response.json())
+            else:
+                print("Cover art for " + mb_responses[no].title + " - " + mb_responses[no].artist + " not found!")
+
+    image_urls = [x["images"][0]["thumbnails"]["small"] for x in ca_results]
+    
+    return image_urls
+
+
+async def url_to_images(url_list: list["str"]) -> list:
+
+    output = []
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [session.get(x) for x in url_list]
+        responses = await asyncio.gather(*tasks)
+
+        for x in responses:
+            if x.status == 200:
+                output.append(Image.open(io.BytesIO(await x.read())))
+
+    return output
+
+
+
+
+def make_collage(pic_list: list, width_aspect: int, height_aspect: int) -> None:
+
+
+    width_aspect = int(width_aspect / math.gcd(width_aspect, height_aspect))
+    height_aspect = int(height_aspect / math.gcd(width_aspect, height_aspect))
+
+    if (len(pic_list) < width_aspect * height_aspect):
+        print("Not enough album art for aspect ratio!")
+
+    else:
+
+        scale_factor = math.sqrt(len(pic_list) /  width_aspect * height_aspect)
+
+        if (not(scale_factor.is_integer())):
+            print("The current aspect ratio does not match up with the amount of cover art. Some images will be discarded.")
+
+        scale_factor = int(scale_factor)
+
+        width = scale_factor * width_aspect
+        height = scale_factor * height_aspect
+
+        output = Image.new("RGB", (250 * width, 250 * height))
+        count = 0
+        for y in range(0, height):
+            for x in range(0, width):
+                output.paste(pic_list[count], (x * 250, y * 250))
+                count += 1
+        
+
+        output.save(os.path.join(sys.path[0], "Output.jpg"))
+
+def main() -> None:
+
+    filename = str(input("Enter the file name: "))
+
+    width, height = 0, 0
+    
+    while(True):
+        try:
+            width = int(input("Enter the width aspect ratio: "))
+        except:
+            print("Incorrect input! Try again")
+        else:
+            break
+    
+
+    while(True):
+        try:
+            height = int(input("Enter the height aspect ratio: "))
+        except:
+            print("Incorrect input! Try again")
+        else:
+            break
+
+    
+
+    while(True):
+        try:
+            album_list = asyncio.run(get_url_from_csv(filename))
+        except:
+            print("File not found! Try again.")
+        else:
+            break
+
+    
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    images = asyncio.run(url_to_images(album_list))
+ 
+    print("%d album art found." % len(images))
+    make_collage(images, width, height)
+    print("Image outputted!")
+
+
+main()
